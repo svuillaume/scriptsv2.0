@@ -29,9 +29,21 @@ spec:
     spec:
       # Uncomment and set when using IRSA:
       # serviceAccountName: forticnapp-inventory
+
+      # lacework-iac-k8s-security-1: pod-level security context
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+
       containers:
         - name: forticnapp-aws-inventory
-          image: ACCOUNT_ID.dkr.ecr.REGION.amazonaws.com/forticnapp-aws-inventory:latest
+          # Pin to a specific image digest — replace :latest with a versioned tag or digest
+          # e.g. ACCOUNT_ID.dkr.ecr.REGION.amazonaws.com/forticnapp-aws-inventory:1.0.0
+          image: ACCOUNT_ID.dkr.ecr.REGION.amazonaws.com/forticnapp-aws-inventory:1.0.0
           imagePullPolicy: Always
           ports:
             - containerPort: 8080
@@ -39,6 +51,20 @@ spec:
           envFrom:
             - secretRef:
                 name: aws-credentials
+
+          # lacework-iac-k8s-security-1: container-level security context
+          # lacework-iac-k8s-security-2: allowPrivilegeEscalation=false
+          # lacework-iac-k8s-workload-3: drop NET_RAW capability
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 1000
+            capabilities:
+              drop:
+                - NET_RAW
+                - ALL
+
           resources:
             requests:
               cpu: "250m"
@@ -46,6 +72,7 @@ spec:
             limits:
               cpu: "500m"
               memory: "1Gi"
+
           livenessProbe:
             httpGet:
               path: /health

@@ -57,10 +57,7 @@ resource "azurerm_virtual_machine" "main" {
   network_interface_ids = [azurerm_network_interface.main.id]
   vm_size               = "Standard_DS1_v2"
 
-  # Uncomment this line to delete the OS disk automatically when deleting the VM
-  delete_os_disk_on_termination = true
-
-  # Uncomment this line to delete the data disks automatically when deleting the VM
+  delete_os_disk_on_termination    = true
   delete_data_disks_on_termination = true
 
   storage_image_reference {
@@ -79,9 +76,10 @@ resource "azurerm_virtual_machine" "main" {
     computer_name  = "hostname"
     admin_username = "testadmin"
     admin_password = random_password.vm_password.result
- }
+  }
   os_profile_linux_config {
-    disable_password_authentication = false
+    # lacework-iac-azure-security-3 (CRITICAL): enforce SSH key auth, disable passwords
+    disable_password_authentication = true
   }
   tags = {
     environment = "staging"
@@ -101,12 +99,65 @@ resource "random_id" "sqlserver" {
   byte_length = 8
 }
 
+# lacework-iac-azure-encryption-13 (HIGH): customer-managed key for storage encryption
+resource "azurerm_key_vault" "example" {
+  name                = "kv-${lower(random_id.storageaccount.hex)}"
+  location            = azurerm_resource_group.example.location
+  resource_group_name = azurerm_resource_group.example.name
+  tenant_id           = data.azurerm_client_config.current.tenant_id
+  sku_name            = "standard"
+
+  purge_protection_enabled = true
+}
+
+data "azurerm_client_config" "current" {}
+
+resource "azurerm_key_vault_key" "storage_cmk" {
+  name         = "storage-cmk"
+  key_vault_id = azurerm_key_vault.example.id
+  key_type     = "RSA"
+  key_size     = 2048
+  key_opts     = ["decrypt", "encrypt", "sign", "unwrapKey", "verify", "wrapKey"]
+}
+
 resource "azurerm_storage_account" "example" {
-  name                     = "${lower(random_id.storageaccount.hex)}"
+  name                     = lower(random_id.storageaccount.hex)
   resource_group_name      = azurerm_resource_group.example.name
   location                 = azurerm_resource_group.example.location
   account_tier             = "Standard"
   account_replication_type = "LRS"
+
+  # lacework-iac-azure-storage-5 (HIGH): disable public network access
+  public_network_access_enabled = false
+
+  # lacework-iac-azure-storage-3 (LOW): enable storage analytics logging
+  blob_properties {
+    logging {
+      delete                = true
+      read                  = true
+      write                 = true
+      version               = "1.0"
+      retention_policy_days = 7
+    }
+  }
+
+  # lacework-iac-azure-encryption-13 (HIGH): use customer-managed key
+  identity {
+    type = "SystemAssigned"
+  }
+
+  # lacework-iac-azure-network-3 (HIGH): default deny + allow trusted Microsoft services
+  # lacework-iac-azure-storage-1 (HIGH): bypass AzureServices for trusted Microsoft services
+  network_rules {
+    default_action = "Deny"
+    bypass         = ["AzureServices", "Logging", "Metrics"]
+  }
+}
+
+resource "azurerm_storage_account_customer_managed_key" "example" {
+  storage_account_id = azurerm_storage_account.example.id
+  key_vault_id       = azurerm_key_vault.example.id
+  key_name           = azurerm_key_vault_key.storage_cmk.name
 }
 
 resource "azurerm_mssql_server" "example1" {
@@ -116,6 +167,16 @@ resource "azurerm_mssql_server" "example1" {
   version                      = "12.0"
   administrator_login          = "4dm1n157r470r"
   administrator_login_password = random_password.sql_password.result
+
+  # lacework-iac-azure-network-23 (HIGH): disable public network access
+  public_network_access_enabled = false
+
+  # lacework-iac-azure-general-16 (LOW): Azure AD authentication for SQL Server
+  azuread_administrator {
+    login_username = "AzureAD Admin"
+    object_id      = data.azurerm_client_config.current.object_id
+    tenant_id      = data.azurerm_client_config.current.tenant_id
+  }
 }
 
 resource "azurerm_mssql_database" "test" {
@@ -131,14 +192,36 @@ resource "azurerm_mssql_database" "test" {
   tags = {
     foo = "bar"
   }
-
 }
+
 resource "azurerm_mssql_database_extended_auditing_policy" "example" {
   database_id                             = azurerm_mssql_database.test.id
   storage_endpoint                        = azurerm_storage_account.example.primary_blob_endpoint
   storage_account_access_key              = azurerm_storage_account.example.primary_access_key
   storage_account_access_key_is_secondary = true
-  retention_in_days                       = 6
+  # lacework-iac-azure-network-6 (LOW): retain audit logs for at least 90 days
+  retention_in_days = 90
+}
+
+# lacework-iac-azure-security-38 (MEDIUM): SQL server security alert policy
+resource "azurerm_mssql_server_security_alert_policy" "example" {
+  resource_group_name = azurerm_resource_group.example.name
+  server_name         = azurerm_mssql_server.example1.name
+  state               = "Enabled"
+  email_account_admins = true
+  retention_days      = 90
+}
+
+# lacework-iac-azure-security-38 (MEDIUM): SQL server vulnerability assessment
+resource "azurerm_mssql_server_vulnerability_assessment" "example" {
+  server_security_alert_policy_id = azurerm_mssql_server_security_alert_policy.example.id
+  storage_container_path          = "${azurerm_storage_account.example.primary_blob_endpoint}vulnerability-assessment/"
+  storage_account_access_key      = azurerm_storage_account.example.primary_access_key
+
+  recurring_scans {
+    enabled                   = true
+    email_subscription_admins = true
+  }
 }
 
 resource "azurerm_resource_group" "example2" {
@@ -185,62 +268,3 @@ resource "azurerm_public_ip" "example3" {
 
   allocation_method = "Dynamic"
 }
-
-/* Commented out for time saving purposes 
-resource "azurerm_virtual_network_gateway" "example2" {
-  name                = "test"
-  location            = azurerm_resource_group.example2.location
-  resource_group_name = azurerm_resource_group.example2.name
-
-  type     = "Vpn"
-  vpn_type = "RouteBased"
-
-  active_active = false
-  enable_bgp    = false
-  sku           = "Basic"
-
-  ip_configuration {
-    name                          = "vnetGatewayConfig"
-    public_ip_address_id          = azurerm_public_ip.example3.id
-    private_ip_address_allocation = "Dynamic"
-    subnet_id                     = azurerm_subnet.example2.id
-  }
-
-  vpn_client_configuration {
-    address_space = ["10.2.0.0/24"]
-
-    root_certificate {
-      name = "DigiCert-Federated-ID-Root-CA"
-
-      public_cert_data = <<EOF
-MIIDuzCCAqOgAwIBAgIQCHTZWCM+IlfFIRXIvyKSrjANBgkqhkiG9w0BAQsFADBn
-MQswCQYDVQQGEwJVUzEVMBMGA1UEChMMRGlnaUNlcnQgSW5jMRkwFwYDVQQLExB3
-d3cuZGlnaWNlcnQuY29tMSYwJAYDVQQDEx1EaWdpQ2VydCBGZWRlcmF0ZWQgSUQg
-Um9vdCBDQTAeFw0xMzAxMTUxMjAwMDBaFw0zMzAxMTUxMjAwMDBaMGcxCzAJBgNV
-BAYTAlVTMRUwEwYDVQQKEwxEaWdpQ2VydCBJbmMxGTAXBgNVBAsTEHd3dy5kaWdp
-Y2VydC5jb20xJjAkBgNVBAMTHURpZ2lDZXJ0IEZlZGVyYXRlZCBJRCBSb290IENB
-MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAvAEB4pcCqnNNOWE6Ur5j
-QPUH+1y1F9KdHTRSza6k5iDlXq1kGS1qAkuKtw9JsiNRrjltmFnzMZRBbX8Tlfl8
-zAhBmb6dDduDGED01kBsTkgywYPxXVTKec0WxYEEF0oMn4wSYNl0lt2eJAKHXjNf
-GTwiibdP8CUR2ghSM2sUTI8Nt1Omfc4SMHhGhYD64uJMbX98THQ/4LMGuYegou+d
-GTiahfHtjn7AboSEknwAMJHCh5RlYZZ6B1O4QbKJ+34Q0eKgnI3X6Vc9u0zf6DH8
-Dk+4zQDYRRTqTnVO3VT8jzqDlCRuNtq6YvryOWN74/dq8LQhUnXHvFyrsdMaE1X2
-DwIDAQABo2MwYTAPBgNVHRMBAf8EBTADAQH/MA4GA1UdDwEB/wQEAwIBhjAdBgNV
-HQ4EFgQUGRdkFnbGt1EWjKwbUne+5OaZvRYwHwYDVR0jBBgwFoAUGRdkFnbGt1EW
-jKwbUne+5OaZvRYwDQYJKoZIhvcNAQELBQADggEBAHcqsHkrjpESqfuVTRiptJfP
-9JbdtWqRTmOf6uJi2c8YVqI6XlKXsD8C1dUUaaHKLUJzvKiazibVuBwMIT84AyqR
-QELn3e0BtgEymEygMU569b01ZPxoFSnNXc7qDZBDef8WfqAV/sxkTi8L9BkmFYfL
-uGLOhRJOFprPdoDIUBB+tmCl3oDcBy3vnUeOEioz8zAkprcb3GHwHAK+vHmmfgcn
-WsfMLH4JCLa/tRYL+Rw/N3ybCkDp00s0WUZ+AoDywSl0Q/ZEnNY0MsFiw6LyIdbq
-M/s/1JRtO3bDSzD9TazRVzn2oBqzSa8VgIo5C1nOnoAKJTlsClJKvIhnRlaLQqk=
-EOF
-
-    }
-
-    revoked_certificate {
-      name       = "Verizon-Global-Root-CA"
-      thumbprint = "912198EEF23DCAC40939312FEE97DD560BAE49B1"
-    }
-  }
-}
-*/

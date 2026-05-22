@@ -1,4 +1,4 @@
-import csv, re, sys, getopt, os, time
+import csv, re, sys, getopt, subprocess, time
 
 # Use-case: scanning a Docker v2 registry that cannot do auto-polling https://docs.lacework.com/integrate-a-docker-v2-registry#container-registry-support
 # First, integrate a Container Registry of Docker v2 kind
@@ -45,8 +45,13 @@ def main(argv):
             if m:
                 #Only scan images that were never scanned (guid="") OR re-scan everything if --force-re-scan is set
                 if eval_guid=="" or forcerescan: 
-                    print ("lacework vulnerability container scan %s %s %s" % (registry, m.group(1), row[1]))
-                    os.system ("lacework vulnerability container scan %s %s %s" % (registry, m.group(1), row[1]))
+                    print("lacework vulnerability container scan %s %s %s" % (registry, m.group(1), row[1]))
+                    # CWE-78 fix: pass args as list to subprocess.run — no shell interpolation
+                    subprocess.run(
+                        ["lacework", "vulnerability", "container", "scan",
+                         registry, m.group(1), row[1]],
+                        check=True
+                    )
                     time.sleep(1)
 
 #lacework vulnerability container scan <registry> <repository> <tag|digest> [flags]
