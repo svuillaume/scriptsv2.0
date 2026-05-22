@@ -1,10 +1,10 @@
-# Handy Bash Scripts for Working with Lacework / FortiCNAPP
+# Handy Bash Scripts for Working with FortiCNAPP
 
 ---
 
 ## lw_aws_inventory.sh
 
-Estimates Lacework / FortiCNAPP license vCPUs across one or more AWS accounts or an entire AWS Organization.  
+Estimates FortiCNAPP license vCPUs across one or more AWS accounts or an entire AWS Organization.  
 Output: a CSV row per account (importable into a spreadsheet) and a human-readable summary.
 
 ### Prerequisites
@@ -125,7 +125,7 @@ INFO:  [logging]   Region 1/3: us-east-1
 "logging",  "345678901234","us-east-1","0","0","0","0","0","0","0","0"
 
 ######################################################################
-  Lacework / FortiCNAPP inventory collection complete  (42s)
+  FortiCNAPP inventory collection complete  (42s)
 ######################################################################
 
   Organizations Analyzed : 1
@@ -257,7 +257,7 @@ $ ./lw_gcp_inventory.sh
 "projects/project-one", 2, 8
 "projects/project-two", 3, 12
 ##########################################
-Lacework inventory collection complete.
+FortiCNAPP inventory collection complete.
 
 License Summary:
 ================================================
@@ -272,7 +272,7 @@ $ ./lw_gcp_inventory.sh -p project-one,project-two
 "projects/project-one", 2, 8
 "projects/project-two", 3, 12
 ##########################################
-Lacework inventory collection complete.
+FortiCNAPP inventory collection complete.
 
 License Summary:
 ================================================
@@ -310,7 +310,7 @@ Load VMSS
 "1215ba55...", "Subscription Number One", 2, 4, 0, 0, 0, 4
 "72165fcf...", "Subscription Number Two", 1, 2, 0, 0, 0, 2
 ##########################################
-Lacework inventory collection complete.
+FortiCNAPP inventory collection complete.
 
 VM Summary:
 ===============================

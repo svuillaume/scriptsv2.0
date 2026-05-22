@@ -1,5 +1,5 @@
 #!/bin/bash
-# Script to fetch AWS inventory for Lacework / FortiCNAPP sizing.
+# Script to fetch AWS inventory for FortiCNAPP sizing.
 # Requirements: awscli v2, jq
 #
 # Run ./lw_aws_inventory.sh -h for help on how to run the script.
@@ -58,7 +58,7 @@ spinner_stop() {
 # Help
 # ─────────────────────────────────────────────────────────────────────────────
 function showHelp {
-  echo -e "${BOLD}lw_aws_inventory.sh${RESET} — Lacework / FortiCNAPP AWS license sizing tool"
+  echo -e "${BOLD}lw_aws_inventory.sh${RESET} — FortiCNAPP AWS license sizing tool"
   echo ""
   echo "Collects EC2, ECS Fargate, and Lambda counts across one or more AWS accounts."
   echo "Output: CSV (importable into a spreadsheet) and a human-readable summary."
@@ -509,7 +509,7 @@ function textoutput {
   local TOTAL_VCPUS=$(( EC2_INSTANCE_VCPU + ECS_FARGATE_VCPUS ))
 
   echo -e "\n${BOLD}######################################################################${RESET}" >&2
-  echo -e "${BOLD}  Lacework / FortiCNAPP inventory collection complete${RESET}  (${elapsed}s)" >&2
+  echo -e "${BOLD}  FortiCNAPP inventory collection complete${RESET}  (${elapsed}s)" >&2
   echo -e "${BOLD}######################################################################${RESET}" >&2
   echo "" >&2
   echo -e "  Organizations Analyzed : ${CYAN}${ORGANIZATIONS}${RESET}" >&2
