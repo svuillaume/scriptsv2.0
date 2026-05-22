@@ -466,11 +466,15 @@ function calculateInventory {
       ECS_FARGATE_CLUSTERS=$(( ECS_FARGATE_CLUSTERS + ecsfargateclusterscount ))
       accountECSFargateClusters=$(( accountECSFargateClusters + ecsfargateclusterscount ))
 
-      # Single combined ECS Fargate call
-      local fargate_metrics
-      mapfile -t fargate_metrics < <(getECSFargateMetrics "$profile_string" "$r" "$ecsfargateclusters")
-      local ecsfargaterunningtasks="${fargate_metrics[0]:-0}"
-      local ecsfargatecpu="${fargate_metrics[1]:-0}"
+      # Single combined ECS Fargate call (bash 3.2 compatible — no mapfile)
+      local fargate_out
+      fargate_out=$(getECSFargateMetrics "$profile_string" "$r" "$ecsfargateclusters")
+      local ecsfargaterunningtasks
+      ecsfargaterunningtasks=$(echo "$fargate_out" | sed -n '1p')
+      local ecsfargatecpu
+      ecsfargatecpu=$(echo "$fargate_out" | sed -n '2p')
+      ecsfargaterunningtasks="${ecsfargaterunningtasks:-0}"
+      ecsfargatecpu="${ecsfargatecpu:-0}"
 
       ECS_FARGATE_RUNNING_TASKS=$(( ECS_FARGATE_RUNNING_TASKS + ecsfargaterunningtasks ))
       accountECSFargateRunningTasks=$(( accountECSFargateRunningTasks + ecsfargaterunningtasks ))
