@@ -1,62 +1,119 @@
 #!/bin/bash
-# Script to fetch AWS inventory for Lacework sizing.
+# Script to fetch AWS inventory for Lacework / FortiCNAPP sizing.
 # Requirements: awscli v2, jq
-
+#
 # Run ./lw_aws_inventory.sh -h for help on how to run the script.
-# Or just read the text in showHelp below.
 
-function showHelp {
-  echo "lw_aws_inventory.sh is a tool for estimating Lacework license vCPUs in an AWS environment."
-  echo "It leverages the AWS CLI and by default the default profile that’s either configured using"
-  echo "environment variables or configuration files in the ~/.aws folder. The script provides"
-  echo "output in a CSV format to be imported into a spreadsheet, as well as an easy-to-read summary."
-  echo ""
-  echo "Note the following about the script:"
-  echo "* Requires AWS CLI v2 to run"
-  echo "* Works great in a cloud shell"
-  echo "* It has been verified to work on Mac and Linux based systems"
-  echo "* Has been observed to work with Windows Subsystem for Linux to run on Windows"
-  echo "* Not compatible with Cygwin on Windows"
-  echo "* Run using the following syntax: ./lw_aws_inventory.sh, sh lw_aws_inventory.sh will not work"
-  echo ""
-  echo "Available flags:"
-  echo " -p       Comma separated list of AWS CLI profiles to scan."
-  echo "          If not specified, the tool will use the connection information that the AWS CLI picks"
-  echo "          by default, which will either be whatever is set in environment variables or as the"
-  echo "          default profile."
-  echo "          ./lw_aws_inventory.sh -p default"
-  echo "          ./lw_aws_inventory.sh -p development,test,production"
-  echo " -r       Comma-separated list of regions to scan."
-  echo "          By default, the script will attempt to collect sizing data for all regions returned by"
-  echo "          aws ec2 describe-regions. This is by default a list of 17 regions. This parameter will"
-  echo "          limit the scope to a pre-defined set of regions, which will avoid errors when regions"
-  echo "          are disabled and speed up the scan."
-  echo "          ./lw_aws_inventory.sh -r us-east-1"
-  echo "          ./lw_aws_inventory.sh -r us-east-1,us-west-1"
-  echo " -o       Scan a complete AWS organization"
-  echo "          This uses aws organizations list-accounts to determine what accounts are in an"
-  echo "          organization and assumes a cross account role to scan each account in the organization,"
-  echo "          except for the master account, which is scanned directly."
-  echo "          The role typically used cross-account access is OrganizationAccountAccessRole, which"
-  echo "          is accessed from a user in the master account."
-  echo "          ./lw_aws_inventory.sh -o OrganizationAccountAccessRole"
-  echo " -a       Scan a specific account within an organization"
-  echo "          This would leverage the cross-account role defined using the -o parameter to only"
-  echo "          scan an individual account within an AWS organisation."
-  echo "          ./lw_aws_inventory.sh -o OrganizationAccountAccessRole -a 1234567890"
-  echo " -g       Specifies a script to be generated that contains a call for each account to be analyzed."
-  echo "          This is useful for analyzing AWS organizations with many accounts to break up the analysis"
-  echo "          into smaller chunks."
-  echo "          ./lw_aws_inventory.sh -o OrganizationAccountAccessRole -a 1234567890 -g script.sh"
-  echo "          ./script.sh"
-  echo " --output Specify level of output"
-  echo "          all         - CSV and summary"
-  echo "          summary     - Summary only"
-  echo "          csv         - CSV only"
-  echo "          csvnoheader - CVS only without header"
-  echo "          ./lw_aws_inventory.sh --ouptput csv"
+# ─────────────────────────────────────────────────────────────────────────────
+# Color / formatting helpers (disabled automatically when not a terminal)
+# ─────────────────────────────────────────────────────────────────────────────
+if [[ -t 1 ]]; then
+  RED='\033[0;31m'; YELLOW='\033[0;33m'; GREEN='\033[0;32m'
+  CYAN='\033[0;36m'; BOLD='\033[1m'; RESET='\033[0m'
+else
+  RED=''; YELLOW=''; GREEN=''; CYAN=''; BOLD=''; RESET=''
+fi
+
+# Always send errors/warnings to stderr so CSV output to stdout stays clean
+err()  { echo -e "${RED}ERROR:${RESET} $*" >&2; }
+warn() { echo -e "${YELLOW}WARN:${RESET}  $*" >&2; }
+info() { echo -e "${CYAN}INFO:${RESET}  $*" >&2; }
+ok()   { echo -e "${GREEN}OK:${RESET}    $*" >&2; }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Error accumulator — collected and printed at end so CSV is not polluted
+# ─────────────────────────────────────────────────────────────────────────────
+ERRORS=()
+add_error() { ERRORS+=("$1"); }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Spinner — shown on stderr so stdout (CSV) is never polluted
+# ─────────────────────────────────────────────────────────────────────────────
+SPINNER_PID=""
+spinner_start() {
+  local msg="${1:-Working…}"
+  if [[ -t 2 ]]; then
+    (
+      local i=0
+      local spin=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+      while true; do
+        printf "\r${CYAN}%s${RESET} %s  " "${spin[$i]}" "$msg" >&2
+        i=$(( (i + 1) % ${#spin[@]} ))
+        sleep 0.1
+      done
+    ) &
+    SPINNER_PID=$!
+  fi
+}
+spinner_stop() {
+  if [[ -n "$SPINNER_PID" ]]; then
+    kill "$SPINNER_PID" 2>/dev/null
+    wait "$SPINNER_PID" 2>/dev/null
+    SPINNER_PID=""
+    printf "\r%-80s\r" " " >&2   # clear the spinner line
+  fi
 }
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Help
+# ─────────────────────────────────────────────────────────────────────────────
+function showHelp {
+  echo -e "${BOLD}lw_aws_inventory.sh${RESET} — Lacework / FortiCNAPP AWS license sizing tool"
+  echo ""
+  echo "Collects EC2, ECS Fargate, and Lambda counts across one or more AWS accounts."
+  echo "Output: CSV (importable into a spreadsheet) and a human-readable summary."
+  echo ""
+  echo -e "${BOLD}Requirements:${RESET}"
+  echo "  • AWS CLI v2   https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html"
+  echo "  • jq           https://jqlang.github.io/jq/download/"
+  echo ""
+  echo -e "${BOLD}Usage:${RESET}"
+  echo "  ./lw_aws_inventory.sh [FLAGS]"
+  echo ""
+  echo -e "${BOLD}Notes:${RESET}"
+  echo "  • Must be run with bash  (./lw_aws_inventory.sh, not sh lw_aws_inventory.sh)"
+  echo "  • Works in AWS CloudShell, Mac, and Linux"
+  echo "  • Has been observed to work on Windows Subsystem for Linux"
+  echo "  • Not compatible with Cygwin on Windows"
+  echo ""
+  echo -e "${BOLD}Flags:${RESET}"
+  echo "  -h            Show this help message."
+  echo ""
+  echo "  -p PROFILES   Comma-separated list of AWS CLI profiles to scan."
+  echo "                Defaults to the AWS CLI default (env vars or ~/.aws/credentials)."
+  echo "                  ./lw_aws_inventory.sh -p default"
+  echo "                  ./lw_aws_inventory.sh -p development,test,production"
+  echo ""
+  echo "  -r REGIONS    Comma-separated list of regions to scan."
+  echo "                Defaults to all regions returned by 'aws ec2 describe-regions'."
+  echo "                Limit scope to avoid errors in disabled regions and speed up the scan."
+  echo "                  ./lw_aws_inventory.sh -r us-east-1"
+  echo "                  ./lw_aws_inventory.sh -r us-east-1,us-west-1"
+  echo ""
+  echo "  -o ROLE       Scan an entire AWS Organization using this cross-account role."
+  echo "                Uses 'aws organizations list-accounts' and assumes the role in each"
+  echo "                member account (except master, which is accessed directly)."
+  echo "                  ./lw_aws_inventory.sh -o OrganizationAccountAccessRole"
+  echo ""
+  echo "  -a ACCOUNT_ID Scan only a specific account within an organization (requires -o)."
+  echo "                  ./lw_aws_inventory.sh -o OrganizationAccountAccessRole -a 123456789012"
+  echo ""
+  echo "  -g FILE       Generate a shell script instead of running the scan immediately."
+  echo "                Useful for large organizations where you want to run per-account chunks."
+  echo "                  ./lw_aws_inventory.sh -o OrganizationAccountAccessRole -g script.sh"
+  echo "                  ./script.sh"
+  echo ""
+  echo "  --output FMT  Control what is printed:"
+  echo "                  all         CSV rows + summary (default)"
+  echo "                  summary     Human-readable summary only"
+  echo "                  csv         CSV rows only (with header)"
+  echo "                  csvnoheader CSV rows only (no header)"
+  echo "                  ./lw_aws_inventory.sh --output csv"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Defaults
+# ─────────────────────────────────────────────────────────────────────────────
 AWS_PROFILE=""
 export AWS_MAX_ATTEMPTS=20
 REGIONS=""
@@ -66,16 +123,24 @@ PRINT_CSV_DETAILS="true"
 PRINT_CSV_HEADER="true"
 PRINT_SUMMARY="true"
 GENERATE_SCRIPT=""
+START_TIME=$(date +%s)
 
+# Preserve original credentials so we can restore after assume-role
 ORG_AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID
 ORG_AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY
 ORG_AWS_SESSION_TOKEN=$AWS_SESSION_TOKEN
 
-CSV_HEADER="\"Profile\", \"Account ID\", \"Regions\", \"EC2 Instances\", \"EC2 vCPUs\", \"ECS Fargate Clusters\", \"ECS Fargate Running Containers/Tasks\", \"ECS Fargate CPU Units\", \"ECS Fargate License vCPUs\", \"Lambda Functions (Not used for licensing)\", \"Total vCPUSs\""
+CSV_HEADER='"Profile","Account ID","Regions","EC2 Instances","EC2 vCPUs","ECS Fargate Clusters","ECS Fargate Running Tasks","ECS Fargate CPU Units","ECS Fargate License vCPUs","Lambda Functions (not used for licensing)","Total vCPUs"'
 
-# Usage: ./lw_aws_inventory.sh
-while getopts ":p:o:r:a:-:g:" opt; do
+# ─────────────────────────────────────────────────────────────────────────────
+# Argument parsing
+# ─────────────────────────────────────────────────────────────────────────────
+while getopts ":hp:o:r:a:-:g:" opt; do
   case ${opt} in
+    h )
+      showHelp
+      exit 0
+      ;;
     p )
       AWS_PROFILE=$OPTARG
       ;;
@@ -92,77 +157,109 @@ while getopts ":p:o:r:a:-:g:" opt; do
       REGIONS=$OPTARG
       ;;
     -)
-        case "${OPTARG}" in
-            #Default configuration is to print CSV and summary. This section overrides those settings as needed
-            output)
-                output="${!OPTIND}"; OPTIND=$(( $OPTIND + 1 ))
-                case "${output}" in
-                  csv)
-                    PRINT_SUMMARY="false"
-                    ;;
-                  summary)
-                    PRINT_CSV_DETAILS="false"
-                    PRINT_CSV_HEADER="false"
-                    ;;
-                  all)
-                    #Do nothing, default configuration
-                    ;;
-                  csvnoheader)
-                    PRINT_CSV_HEADER="false"
-                    PRINT_SUMMARY="false"
-                    ;;
-                  *)
-                    echo "Invalid argument. Valid options for --output: csv, summary, all, csvnoheader"
-                    showHelp
-                    exit  
-                    ;;
-                esac
-                ;;
-            *)
-              showHelp
-              exit
+      case "${OPTARG}" in
+        output)
+          output="${!OPTIND}"; OPTIND=$(( $OPTIND + 1 ))
+          case "${output}" in
+            csv)
+              PRINT_SUMMARY="false"
               ;;
-        esac;;    
+            summary)
+              PRINT_CSV_DETAILS="false"
+              PRINT_CSV_HEADER="false"
+              ;;
+            all)
+              : # default — do nothing
+              ;;
+            csvnoheader)
+              PRINT_CSV_HEADER="false"
+              PRINT_SUMMARY="false"
+              ;;
+            *)
+              err "Invalid --output value '${output}'. Valid options: all, csv, summary, csvnoheader"
+              echo "" >&2
+              showHelp >&2
+              exit 1
+              ;;
+          esac
+          ;;
+        help)
+          showHelp
+          exit 0
+          ;;
+        *)
+          err "Unknown flag --${OPTARG}"
+          echo "" >&2
+          showHelp >&2
+          exit 1
+          ;;
+      esac
+      ;;
     \? )
-      showHelp
+      err "Unknown flag -$OPTARG"
+      echo "" >&2
+      showHelp >&2
       exit 1
       ;;
     : )
-      showHelp
+      err "Flag -$OPTARG requires an argument."
+      echo "" >&2
+      showHelp >&2
       exit 1
       ;;
   esac
 done
 shift $((OPTIND -1))
 
-#Check AWS CLI pre-requisites
+# ─────────────────────────────────────────────────────────────────────────────
+# Flag validation
+# ─────────────────────────────────────────────────────────────────────────────
+if [[ -n "$ORG_SCAN_ACCOUNT" && -z "$ORG_ACCESS_ROLE" ]]; then
+  err "Flag -a (account) requires -o (cross-account role) to be set as well."
+  exit 1
+fi
+
+if [[ -n "$ORG_SCAN_ACCOUNT" ]] && ! [[ "$ORG_SCAN_ACCOUNT" =~ ^[0-9]{12}$ ]]; then
+  err "Account ID '${ORG_SCAN_ACCOUNT}' is not a valid 12-digit AWS account ID."
+  exit 1
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Pre-requisite checks
+# ─────────────────────────────────────────────────────────────────────────────
+
+# 1. Bash shell
+if ! echo "$BASH" | grep -q "bash"; then
+  err "This script must be run with bash."
+  err "Use: ./lw_aws_inventory.sh (not: sh lw_aws_inventory.sh)"
+  exit 1
+fi
+
+# 2. AWS CLI installed
+if ! command -v aws &>/dev/null; then
+  err "AWS CLI is not installed or not in PATH."
+  err "Install it from: https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html"
+  exit 1
+fi
+
+# 3. AWS CLI version >= 2
 AWS_CLI_VERSION=$(aws --version 2>&1 | cut -d " " -f1 | cut -d "/" -f2)
-if [[ $AWS_CLI_VERSION = 1* ]]
-then
-  echo The script requires AWS CLI v2 to run. The current version installed is version $AWS_CLI_VERSION.
-  echo See https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html for instructions on how to upgrade.
-  exit
+if [[ "$AWS_CLI_VERSION" = 1* ]]; then
+  err "AWS CLI v2 is required. Detected version: ${AWS_CLI_VERSION}"
+  err "Upgrade: https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html"
+  exit 1
 fi
 
-#Ensure the script runs with the BASH shell
-echo $BASH | grep -q "bash"
-if [ $? -ne 0 ]
-then
-  echo The script is running using the incorrect shell.
-  echo Use ./lw_aws_inventory.sh to run the script using the required shell, bash.
-  exit
+# 4. jq installed
+if ! command -v jq &>/dev/null; then
+  err "jq is not installed or not in PATH."
+  err "Install it from: https://jqlang.github.io/jq/download/"
+  exit 1
 fi
 
-#Ensure jq is installed
-
-if ! command -v jq &> /dev/null
-then
-    echo "The script requires jq to run."
-    echo "See https://jqlang.github.io/jq/download/ for installation options."
-    exit 1
-fi
-
-# Set the initial counts to zero.
+# ─────────────────────────────────────────────────────────────────────────────
+# Global counters
+# ─────────────────────────────────────────────────────────────────────────────
 ACCOUNTS=0
 ORGANIZATIONS=0
 EC2_INSTANCES=0
@@ -172,219 +269,330 @@ ECS_FARGATE_RUNNING_TASKS=0
 ECS_FARGATE_CPUS=0
 LAMBDA_FUNCTIONS=0
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Cleanup on exit — restore original AWS credentials
+# ─────────────────────────────────────────────────────────────────────────────
 function cleanup {
-  # Revert to original AWS CLI configuration if script is stopped during execution
+  spinner_stop
   export AWS_ACCESS_KEY_ID=$ORG_AWS_ACCESS_KEY_ID
   export AWS_SECRET_ACCESS_KEY=$ORG_AWS_SECRET_ACCESS_KEY
   export AWS_SESSION_TOKEN=$ORG_AWS_SESSION_TOKEN
 }
 trap cleanup EXIT
 
+# ─────────────────────────────────────────────────────────────────────────────
+# AWS helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
 function getAccountId {
   local profile_string=$1
-  aws $profile_string sts get-caller-identity --query "Account" --output text
+  local result
+  result=$(aws $profile_string sts get-caller-identity --query "Account" --output text 2>&1)
+  if [[ $? -ne 0 ]]; then
+    echo ""
+    add_error "sts get-caller-identity failed (profile_string='${profile_string}'): ${result}"
+    return 1
+  fi
+  echo "$result"
 }
 
 function getRegions {
   local profile_string=$1
-  aws $profile_string ec2 describe-regions --output json | jq -r '.[] | .[] | .RegionName'
+  local result
+  result=$(aws $profile_string ec2 describe-regions --output json 2>&1)
+  if [[ $? -ne 0 ]]; then
+    add_error "ec2 describe-regions failed: ${result}"
+    echo ""
+    return 1
+  fi
+  echo "$result" | jq -r '.Regions[].RegionName'
 }
 
 function getEC2Instances {
   local profile_string=$1
   local r=$2
-  local instances=$(aws $profile_string ec2 describe-instances --query 'Reservations[*].Instances[*].[InstanceId]' --filters Name=instance-state-name,Values=running --region $r --output json --no-cli-pager  2>&1)
-  if [[ $instances = [* ]] 
-  then
-    echo $(echo $instances | jq 'flatten | length')
+  local instances
+  instances=$(aws $profile_string ec2 describe-instances \
+    --query 'Reservations[*].Instances[*].[InstanceId]' \
+    --filters Name=instance-state-name,Values=running \
+    --region "$r" --output json --no-cli-pager 2>&1)
+  if [[ $instances = \[* ]]; then
+    echo "$instances" | jq 'flatten | length'
   else
     echo "-1"
   fi
 }
 
-function getEC2InstacevCPUs {
+function getEC2InstancevCPUs {
   local profile_string=$1
   local r=$2
-  cpucounts=$(aws $profile_string ec2 describe-instances --query 'Reservations[*].Instances[*].[CpuOptions]' --filters Name=instance-state-name,Values=running --region $r --output json --no-cli-pager | jq  '.[] | .[] | .[] | .CoreCount * .ThreadsPerCore')
-  returncount=0
+  local cpucounts returncount=0
+  cpucounts=$(aws $profile_string ec2 describe-instances \
+    --query 'Reservations[*].Instances[*].[CpuOptions]' \
+    --filters Name=instance-state-name,Values=running \
+    --region "$r" --output json --no-cli-pager 2>/dev/null \
+    | jq '.[] | .[] | .[] | .CoreCount * .ThreadsPerCore')
   for cpucount in $cpucounts; do
-    returncount=$(($returncount + $cpucount))
+    returncount=$(( returncount + cpucount ))
   done
-  echo "${returncount}"
+  echo "$returncount"
 }
 
 function getECSFargateClusters {
   local profile_string=$1
   local r=$2
-  aws $profile_string ecs list-clusters --region $r --output json --no-cli-pager | jq -r '.clusterArns[]'
+  aws $profile_string ecs list-clusters --region "$r" --output json --no-cli-pager 2>/dev/null \
+    | jq -r '.clusterArns[]'
 }
 
-function getECSFargateRunningTasks {
+# Combined ECS Fargate helper — single describe-tasks call per batch, returns
+# two numbers on two lines: running_tasks  running_cpu_units
+function getECSFargateMetrics {
   local profile_string=$1
   local r=$2
   local ecsfargateclusters=$3
-  local RUNNING_FARGATE_TASKS=0
+  local RUNNING_TASKS=0
+  local RUNNING_CPUS=0
+
   for c in $ecsfargateclusters; do
-    allclustertasks=$(aws $profile_string ecs list-tasks --region $r --output json --cluster $c --no-cli-pager | jq -r '.taskArns | join(" ")')
+    local allclustertasks
+    allclustertasks=$(aws $profile_string ecs list-tasks \
+      --region "$r" --output json --cluster "$c" --no-cli-pager 2>/dev/null \
+      | jq -r '.taskArns | join(" ")')
+
     while read -r batch; do
-      if [ -n "${batch}" ]; then
-        fargaterunningtasks=$(aws $profile_string ecs describe-tasks --region $r --output json --tasks $batch --cluster $c --no-cli-pager | jq '[.tasks[] | select(.launchType=="FARGATE") | select(.lastStatus=="RUNNING")] | length')
-        RUNNING_FARGATE_TASKS=$(($RUNNING_FARGATE_TASKS + $fargaterunningtasks))
+      if [[ -n "$batch" ]]; then
+        local tasks_json
+        tasks_json=$(aws $profile_string ecs describe-tasks \
+          --region "$r" --output json --tasks $batch --cluster "$c" --no-cli-pager 2>/dev/null)
+
+        local batch_tasks
+        batch_tasks=$(echo "$tasks_json" \
+          | jq '[.tasks[] | select(.launchType=="FARGATE") | select(.lastStatus=="RUNNING")] | length')
+        RUNNING_TASKS=$(( RUNNING_TASKS + batch_tasks ))
+
+        local batch_cpus
+        batch_cpus=$(echo "$tasks_json" \
+          | jq '[.tasks[] | select(.launchType=="FARGATE") | select(.lastStatus=="RUNNING")] | map(.cpu | tonumber) | add // 0')
+        RUNNING_CPUS=$(( RUNNING_CPUS + batch_cpus ))
       fi
-    done < <(echo $allclustertasks | xargs -n 90)
+    done < <(echo "$allclustertasks" | xargs -n 90)
   done
 
-  echo "${RUNNING_FARGATE_TASKS}"
-}
-
-function getECSFargateRunningCPUs {
-  local profile_string=$1
-  local r=$2
-  local ecsfargateclusters=$3
-  local RUNNING_FARGATE_CPUS=0
-  for c in $ecsfargateclusters; do
-    allclustertasks=$(aws $profile_string ecs list-tasks --region $r --output json --cluster $c --no-cli-pager | jq -r '.taskArns | join(" ")')
-    while read -r batch; do
-      if [ -n "${batch}" ]; then
-        cpucounts=$(aws $profile_string ecs describe-tasks --region $r --output json --tasks $batch --cluster $c --no-cli-pager | jq '[.tasks[] | select(.launchType=="FARGATE") | select(.lastStatus=="RUNNING")] | .[].cpu | tonumber')
-
-        for cpucount in $cpucounts; do
-          RUNNING_FARGATE_CPUS=$(($RUNNING_FARGATE_CPUS + $cpucount))
-        done
-      fi
-    done < <(echo $allclustertasks | xargs -n 90)
-  done
-
-  echo "${RUNNING_FARGATE_CPUS}"
+  echo "$RUNNING_TASKS"
+  echo "$RUNNING_CPUS"
 }
 
 function getLambdaFunctions {
   local profile_string=$1
   local r=$2
-  aws $profile_string lambda list-functions --region $r --output json --no-cli-pager | jq '.Functions | length'
+  local result
+  result=$(aws $profile_string lambda list-functions \
+    --region "$r" --output json --no-cli-pager 2>/dev/null \
+    | jq '.Functions | length')
+  echo "${result:-0}"
 }
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Per-account inventory scan
+# ─────────────────────────────────────────────────────────────────────────────
 function calculateInventory {
   local account_name=$1
   local profile_string=$2
-  local accountid=$(getAccountId "$profile_string")
+  local label="${account_name:-default}"
+
+  local accountid
+  accountid=$(getAccountId "$profile_string")
+  if [[ -z "$accountid" ]]; then
+    add_error "Could not resolve account ID for '${label}'. Skipping."
+    warn "Skipping '${label}' — could not resolve account ID."
+    return 1
+  fi
+
   local accountEC2Instances=0
   local accountEC2vCPUs=0
   local accountECSFargateClusters=0
   local accountECSFargateRunningTasks=0
   local accountECSFargateCPUs=0
   local accountLambdaFunctions=0
-  local accountTotalvCPUs=0
+  local regionsScanned=""
 
-  if [[ $PRINT_CSV_DETAILS == "true" ]]
-  then
-    printf "$account_name, $accountid,"
+  # Resolve region list
+  local regionsToScan
+  if [[ -n "$REGIONS" ]]; then
+    regionsToScan=$(echo "$REGIONS" | sed "s/,/ /g")
+  else
+    spinner_start "Fetching region list for ${label}…"
+    regionsToScan=$(getRegions "$profile_string")
+    spinner_stop
+    if [[ -z "$regionsToScan" ]]; then
+      add_error "Could not retrieve region list for '${label}'. Skipping."
+      warn "Skipping '${label}' — could not retrieve region list."
+      return 1
+    fi
   fi
-  local regionsToScan=$(echo $REGIONS | sed "s/,/ /g")
-  if [ -z "$regionsToScan" ]
-  then
-      # Regions to scan not set, get list from AWS
-      regionsToScan=$(getRegions "$profile_string")
-  fi
+
+  local regionCount
+  regionCount=$(echo "$regionsToScan" | wc -w | xargs)
+  local regionIdx=0
+
   for r in $regionsToScan; do
-    if [[ $PRINT_CSV_DETAILS == "true" ]]
-    then
-      printf " $r"
-    fi
+    regionIdx=$(( regionIdx + 1 ))
+    spinner_start "[${label}] Region ${regionIdx}/${regionCount}: ${r}"
 
+    local instances
     instances=$(getEC2Instances "$profile_string" "$r")
-    if [[ $instances < 0 ]]
-    then
-      printf " (ERROR: No access to $r)"
+
+    if [[ "$instances" -lt 0 ]]; then
+      spinner_stop
+      warn "[${label}] No access to region ${r} — skipping."
+      add_error "No access to region ${r} in account '${label}' (${accountid})."
     else
-      EC2_INSTANCES=$(($EC2_INSTANCES + $instances))
-      accountEC2Instances=$(($accountEC2Instances + $instances))
+      regionsScanned="${regionsScanned} ${r}"
 
-      ec2vcpu=$(getEC2InstacevCPUs "$profile_string" "$r")
-      EC2_INSTANCE_VCPU=$(($EC2_INSTANCE_VCPU + $ec2vcpu))
-      accountEC2vCPUs=$(($accountEC2vCPUs + $ec2vcpu))
+      EC2_INSTANCES=$(( EC2_INSTANCES + instances ))
+      accountEC2Instances=$(( accountEC2Instances + instances ))
 
+      local ec2vcpu
+      ec2vcpu=$(getEC2InstancevCPUs "$profile_string" "$r")
+      EC2_INSTANCE_VCPU=$(( EC2_INSTANCE_VCPU + ec2vcpu ))
+      accountEC2vCPUs=$(( accountEC2vCPUs + ec2vcpu ))
+
+      local ecsfargateclusters
       ecsfargateclusters=$(getECSFargateClusters "$profile_string" "$r")
-      ecsfargateclusterscount=$(echo $ecsfargateclusters | wc -w | xargs)
-      ECS_FARGATE_CLUSTERS=$(($ECS_FARGATE_CLUSTERS + $ecsfargateclusterscount))
-      accountECSFargateClusters=$(($accountECSFargateClusters + $ecsfargateclusterscount))
+      local ecsfargateclusterscount
+      ecsfargateclusterscount=$(echo "$ecsfargateclusters" | grep -c . || true)
+      [[ -z "$ecsfargateclusters" ]] && ecsfargateclusterscount=0
+      ECS_FARGATE_CLUSTERS=$(( ECS_FARGATE_CLUSTERS + ecsfargateclusterscount ))
+      accountECSFargateClusters=$(( accountECSFargateClusters + ecsfargateclusterscount ))
 
-      ecsfargaterunningtasks=$(getECSFargateRunningTasks "$profile_string" "$r" "$ecsfargateclusters")
-      ECS_FARGATE_RUNNING_TASKS=$(($ECS_FARGATE_RUNNING_TASKS + $ecsfargaterunningtasks))
-      accountECSFargateRunningTasks=$(($accountECSFargateRunningTasks + $ecsfargaterunningtasks))
+      # Single combined ECS Fargate call
+      local fargate_metrics
+      mapfile -t fargate_metrics < <(getECSFargateMetrics "$profile_string" "$r" "$ecsfargateclusters")
+      local ecsfargaterunningtasks="${fargate_metrics[0]:-0}"
+      local ecsfargatecpu="${fargate_metrics[1]:-0}"
 
-      ecsfargatecpu=$(getECSFargateRunningCPUs "$profile_string" "$r" "$ecsfargateclusters")
-      ECS_FARGATE_CPUS=$(($ECS_FARGATE_CPUS + $ecsfargatecpu))
-      accountECSFargateCPUs=$(($accountECSFargateCPUs + $ecsfargatecpu))
+      ECS_FARGATE_RUNNING_TASKS=$(( ECS_FARGATE_RUNNING_TASKS + ecsfargaterunningtasks ))
+      accountECSFargateRunningTasks=$(( accountECSFargateRunningTasks + ecsfargaterunningtasks ))
 
+      ECS_FARGATE_CPUS=$(( ECS_FARGATE_CPUS + ecsfargatecpu ))
+      accountECSFargateCPUs=$(( accountECSFargateCPUs + ecsfargatecpu ))
+
+      local lambdafunctions
       lambdafunctions=$(getLambdaFunctions "$profile_string" "$r")
-      LAMBDA_FUNCTIONS=$(($LAMBDA_FUNCTIONS + $lambdafunctions))
-      accountLambdaFunctions=$(($accountLambdaFunctions + $lambdafunctions))
+      LAMBDA_FUNCTIONS=$(( LAMBDA_FUNCTIONS + lambdafunctions ))
+      accountLambdaFunctions=$(( accountLambdaFunctions + lambdafunctions ))
     fi
+    spinner_stop
   done
 
-  accountECSFargatevCPUs=$(($accountECSFargateCPUs / 1024))
-  accountTotalvCPUs=$(($accountEC2vCPUs + $accountECSFargatevCPUs))
+  local accountECSFargatevCPUs=$(( accountECSFargateCPUs / 1024 ))
+  local accountTotalvCPUs=$(( accountEC2vCPUs + accountECSFargatevCPUs ))
+  local scannedRegionList
+  scannedRegionList=$(echo "$regionsScanned" | xargs | sed "s/ /|/g")
 
-    if [[ $PRINT_CSV_DETAILS == "true" ]]
-    then
-      echo , "$accountEC2Instances", "$accountEC2vCPUs", "$accountECSFargateClusters", "$accountECSFargateRunningTasks", "$accountECSFargateCPUs", "$accountECSFargatevCPUs", "$accountLambdaFunctions", "$accountTotalvCPUs"
-    fi
+  if [[ $PRINT_CSV_DETAILS == "true" ]]; then
+    echo "\"${label}\",\"${accountid}\",\"${scannedRegionList}\",\"${accountEC2Instances}\",\"${accountEC2vCPUs}\",\"${accountECSFargateClusters}\",\"${accountECSFargateRunningTasks}\",\"${accountECSFargateCPUs}\",\"${accountECSFargatevCPUs}\",\"${accountLambdaFunctions}\",\"${accountTotalvCPUs}\""
+  fi
 }
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Summary output
+# ─────────────────────────────────────────────────────────────────────────────
 function textoutput {
-  echo "######################################################################"
-  echo "Lacework inventory collection complete."
-  echo ""
-  echo "Organizations Analyzed: $ORGANIZATIONS"
-  echo "Accounts Analyzed:      $ACCOUNTS"
-  echo ""
-  echo "EC2 Information"
-  echo "===================="
-  echo "EC2 Instances:     $EC2_INSTANCES"
-  echo "EC2 vCPUs:         $EC2_INSTANCE_VCPU"
-  echo ""
-  echo "Fargate Information"
-  echo "===================="
-  echo "ECS Clusters:                    $ECS_FARGATE_CLUSTERS"
-  echo "ECS Fargate Running Tasks:       $ECS_FARGATE_RUNNING_TASKS"
-  echo "ECS Fargate Container CPU Units: $ECS_FARGATE_CPUS"
-  echo "ECS Fargate vCPUs:               $ECS_FARGATE_VCPUS"
-  echo ""
-  echo "Lambda Information (Not used for licensing)"
-  echo "============================================"
-  echo "Lambda Functions:     $LAMBDA_FUNCTIONS"
-  echo ""
-  echo "License Summary"
-  echo "===================="
-  echo "  EC2 vCPUs:            $EC2_INSTANCE_VCPU"
-  echo "+ ECS Fargate vCPUs:    $ECS_FARGATE_VCPUS"
-  echo "----------------------------"
-  echo "= Total vCPUs:          $TOTAL_VCPUS"
+  local elapsed=$(( $(date +%s) - START_TIME ))
+  local ECS_FARGATE_VCPUS=$(( ECS_FARGATE_CPUS / 1024 ))
+  local TOTAL_VCPUS=$(( EC2_INSTANCE_VCPU + ECS_FARGATE_VCPUS ))
+
+  echo -e "\n${BOLD}######################################################################${RESET}" >&2
+  echo -e "${BOLD}  Lacework / FortiCNAPP inventory collection complete${RESET}  (${elapsed}s)" >&2
+  echo -e "${BOLD}######################################################################${RESET}" >&2
+  echo "" >&2
+  echo -e "  Organizations Analyzed : ${CYAN}${ORGANIZATIONS}${RESET}" >&2
+  echo -e "  Accounts Analyzed      : ${CYAN}${ACCOUNTS}${RESET}" >&2
+  echo "" >&2
+  echo -e "  ${BOLD}EC2${RESET}" >&2
+  echo -e "  ─────────────────────────────────" >&2
+  echo -e "  Instances              : ${GREEN}${EC2_INSTANCES}${RESET}" >&2
+  echo -e "  vCPUs                  : ${GREEN}${EC2_INSTANCE_VCPU}${RESET}" >&2
+  echo "" >&2
+  echo -e "  ${BOLD}ECS Fargate${RESET}" >&2
+  echo -e "  ─────────────────────────────────" >&2
+  echo -e "  Clusters               : ${GREEN}${ECS_FARGATE_CLUSTERS}${RESET}" >&2
+  echo -e "  Running Tasks          : ${GREEN}${ECS_FARGATE_RUNNING_TASKS}${RESET}" >&2
+  echo -e "  Container CPU Units    : ${GREEN}${ECS_FARGATE_CPUS}${RESET}" >&2
+  echo -e "  License vCPUs          : ${GREEN}${ECS_FARGATE_VCPUS}${RESET}" >&2
+  echo "" >&2
+  echo -e "  ${BOLD}Lambda (not used for licensing)${RESET}" >&2
+  echo -e "  ─────────────────────────────────" >&2
+  echo -e "  Functions              : ${GREEN}${LAMBDA_FUNCTIONS}${RESET}" >&2
+  echo "" >&2
+  echo -e "  ${BOLD}License Estimate${RESET}" >&2
+  echo -e "  ─────────────────────────────────" >&2
+  echo -e "    EC2 vCPUs            : ${EC2_INSTANCE_VCPU}" >&2
+  echo -e "  + ECS Fargate vCPUs   : ${ECS_FARGATE_VCPUS}" >&2
+  echo -e "  ─────────────────────────────────" >&2
+  echo -e "  = ${BOLD}Total vCPUs${RESET}           : ${BOLD}${GREEN}${TOTAL_VCPUS}${RESET}" >&2
+  echo "" >&2
+
+  # Print collected errors (if any)
+  if [[ ${#ERRORS[@]} -gt 0 ]]; then
+    echo -e "  ${BOLD}${RED}Errors / Warnings (${#ERRORS[@]})${RESET}" >&2
+    echo -e "  ─────────────────────────────────" >&2
+    for e in "${ERRORS[@]}"; do
+      echo -e "  ${RED}•${RESET} ${e}" >&2
+    done
+    echo "" >&2
+  fi
 }
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Organization scan helpers
+# ─────────────────────────────────────────────────────────────────────────────
 function analyzeOrganization {
-    local org_profile_string=$1
-    local orgAccountId=$(getAccountId "$org_profile_string")
-    local accounts=$(aws $org_profile_string organizations list-accounts | jq -c '.Accounts[]' | jq -c '{Id, Name}')
-    if [ -n "$ORG_SCAN_ACCOUNT" ]
-    then
-      local account_name=$(echo $accounts | jq -r --arg account "$ORG_SCAN_ACCOUNT" 'select(.Id==$account) | .Name')
-      analyzeOrganizationAccount "$org_profile_string" "$ORG_SCAN_ACCOUNT" "$account_name"
-    else
-      for account in $(echo $accounts | jq -r '.Id')
-      do
-          local account_name=$(echo $accounts | jq -r --arg account "$account" 'select(.Id==$account) | .Name')
-          if [[ $orgAccountId == $account ]]
-          then
-            # Found master account, role most likely don't exist, just connnect directly
-            ACCOUNTS=$(($ACCOUNTS + 1))
-            calculateInventory "$account_name" "$org_profile_string"
-          else
-            analyzeOrganizationAccount "$org_profile_string" "$account" "$account_name"
-          fi
-      done
+  local org_profile_string=$1
+  local orgAccountId
+  orgAccountId=$(getAccountId "$org_profile_string")
+
+  spinner_start "Fetching organization account list…"
+  local accounts
+  accounts=$(aws $org_profile_string organizations list-accounts 2>&1 \
+    | jq -c '.Accounts[] | {Id, Name}')
+  spinner_stop
+
+  if [[ -z "$accounts" ]]; then
+    err "Failed to list organization accounts. Check that Organizations access is enabled."
+    add_error "Could not list organization accounts."
+    return 1
+  fi
+
+  local total_accounts
+  total_accounts=$(echo "$accounts" | wc -l | xargs)
+  local current_account=0
+
+  if [[ -n "$ORG_SCAN_ACCOUNT" ]]; then
+    local account_name
+    account_name=$(echo "$accounts" | jq -r --arg a "$ORG_SCAN_ACCOUNT" 'select(.Id==$a) | .Name')
+    if [[ -z "$account_name" ]]; then
+      err "Account ID '${ORG_SCAN_ACCOUNT}' not found in organization."
+      return 1
     fi
+    analyzeOrganizationAccount "$org_profile_string" "$ORG_SCAN_ACCOUNT" "$account_name"
+  else
+    for account in $(echo "$accounts" | jq -r '.Id'); do
+      current_account=$(( current_account + 1 ))
+      local account_name
+      account_name=$(echo "$accounts" | jq -r --arg a "$account" 'select(.Id==$a) | .Name')
+      info "Account ${current_account}/${total_accounts}: ${account_name} (${account})"
+      if [[ "$orgAccountId" == "$account" ]]; then
+        # Master account — access directly (role may not exist)
+        ACCOUNTS=$(( ACCOUNTS + 1 ))
+        calculateInventory "$account_name" "$org_profile_string"
+      else
+        analyzeOrganizationAccount "$org_profile_string" "$account" "$account_name"
+      fi
+    done
+  fi
 }
 
 function analyzeOrganizationAccount {
@@ -392,127 +600,150 @@ function analyzeOrganizationAccount {
   local account=$2
   local account_name=$3
 
-  local account_credentials=$(aws $org_profile_string sts assume-role --role-session-name LW-INVENTORY --role-arn arn:aws:iam::$account:role/$ORG_ACCESS_ROLE 2>&1)
-  if [[ $account_credentials = {* ]] 
-  then
-    #Got ok credential back, do analysis
-    ACCOUNTS=$(($ACCOUNTS + 1))
-    export AWS_ACCESS_KEY_ID=$(echo $account_credentials | jq -r '.Credentials.AccessKeyId')
-    export AWS_SECRET_ACCESS_KEY=$(echo $account_credentials | jq -r '.Credentials.SecretAccessKey')
-    export AWS_SESSION_TOKEN=$(echo $account_credentials | jq -r '.Credentials.SessionToken')
+  local account_credentials
+  account_credentials=$(aws $org_profile_string sts assume-role \
+    --role-session-name LW-INVENTORY \
+    --role-arn "arn:aws:iam::${account}:role/${ORG_ACCESS_ROLE}" 2>&1)
+
+  if [[ $account_credentials = \{* ]]; then
+    ACCOUNTS=$(( ACCOUNTS + 1 ))
+    export AWS_ACCESS_KEY_ID=$(echo "$account_credentials" | jq -r '.Credentials.AccessKeyId')
+    export AWS_SECRET_ACCESS_KEY=$(echo "$account_credentials" | jq -r '.Credentials.SecretAccessKey')
+    export AWS_SESSION_TOKEN=$(echo "$account_credentials" | jq -r '.Credentials.SessionToken')
     calculateInventory "$account_name" ""
+    # Restore org credentials
     export AWS_ACCESS_KEY_ID=$ORG_AWS_ACCESS_KEY_ID
     export AWS_SECRET_ACCESS_KEY=$ORG_AWS_SECRET_ACCESS_KEY
     export AWS_SESSION_TOKEN=$ORG_AWS_SESSION_TOKEN
   else
-    #Failed to connect, print error message
-    echo "ERROR: Failed to connect to account \"$account_name\" ($account). ${account_credentials}"
-    echo "aws $org_profile_string sts assume-role --role-session-name LW-INVENTORY --role-arn arn:aws:iam::$account:role/$ORG_ACCESS_ROLE"
+    err "Failed to assume role in account '${account_name}' (${account})."
+    err "Role ARN: arn:aws:iam::${account}:role/${ORG_ACCESS_ROLE}"
+    err "AWS response: ${account_credentials}"
+    add_error "Could not assume role in '${account_name}' (${account}): ${account_credentials}"
   fi
 }
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Main analysis runner
+# ─────────────────────────────────────────────────────────────────────────────
 function runAnalysis {
-  if [[ $PRINT_CSV_HEADER == "true" ]]
-  then
-    echo $CSV_HEADER
+  if [[ $PRINT_CSV_HEADER == "true" ]]; then
+    echo "$CSV_HEADER"
   fi
 
-  if [ -n "$ORG_ACCESS_ROLE" ]
-  then
-      for PROFILE in $(echo $AWS_PROFILE | sed "s/,/ /g")
-      do
-          ORGANIZATIONS=$(($ORGANIZATIONS + 1))
-          PROFILE_STRING="--profile $PROFILE"
-          analyzeOrganization "$PROFILE_STRING"
-      done
+  local HAS_PROFILE=false
 
-      if [ -z "$PROFILE" ]
-      then
-          ORGANIZATIONS=1
-          analyzeOrganization ""
-      fi
+  if [[ -n "$ORG_ACCESS_ROLE" ]]; then
+    if [[ -n "$AWS_PROFILE" ]]; then
+      HAS_PROFILE=true
+      for PROFILE in $(echo "$AWS_PROFILE" | sed "s/,/ /g"); do
+        ORGANIZATIONS=$(( ORGANIZATIONS + 1 ))
+        info "Scanning organization via profile: ${PROFILE}"
+        analyzeOrganization "--profile $PROFILE"
+      done
+    fi
+    if [[ "$HAS_PROFILE" == "false" ]]; then
+      ORGANIZATIONS=1
+      info "Scanning organization via default credentials"
+      analyzeOrganization ""
+    fi
   else
-      for PROFILE in $(echo $AWS_PROFILE | sed "s/,/ /g")
-      do
-          # Profile set
-          PROFILE_STRING="--profile $PROFILE"
-          ACCOUNTS=$(($ACCOUNTS + 1))
-          calculateInventory "$PROFILE" "$PROFILE_STRING"
+    if [[ -n "$AWS_PROFILE" ]]; then
+      HAS_PROFILE=true
+      for PROFILE in $(echo "$AWS_PROFILE" | sed "s/,/ /g"); do
+        info "Scanning account via profile: ${PROFILE}"
+        ACCOUNTS=$(( ACCOUNTS + 1 ))
+        calculateInventory "$PROFILE" "--profile $PROFILE"
       done
-
-      if [ -z "$PROFILE" ]
-      then
-          # No profile argument, run AWS CLI default
-          ACCOUNTS=1
-          calculateInventory "" ""
-      fi
+    fi
+    if [[ "$HAS_PROFILE" == "false" ]]; then
+      info "Scanning account via default credentials"
+      ACCOUNTS=1
+      calculateInventory "" ""
+    fi
   fi
 
-  ECS_FARGATE_VCPUS=$(($ECS_FARGATE_CPUS / 1024))
-  TOTAL_VCPUS=$(($EC2_INSTANCE_VCPU + $ECS_FARGATE_VCPUS))
-
-  if [[ $PRINT_SUMMARY == "true" ]]
-  then
+  if [[ $PRINT_SUMMARY == "true" ]]; then
     textoutput
+  elif [[ ${#ERRORS[@]} -gt 0 ]]; then
+    # Always print errors to stderr even in csv-only mode
+    echo -e "\n${RED}${#ERRORS[@]} error(s) occurred during the scan:${RESET}" >&2
+    for e in "${ERRORS[@]}"; do
+      echo -e "  ${RED}•${RESET} ${e}" >&2
+    done
   fi
 }
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Script generator
+# ─────────────────────────────────────────────────────────────────────────────
 function generateOrganizationScript {
   local profile=$1
   local cliProfileString=$2
   local regionString=$3
-  local orgMasterAccountID=$(getAccountId "$cliProfileString")
-  local accounts=$(aws $cliProfileString organizations list-accounts | jq -c '.Accounts[]' | jq -c '{Id, Name}')
+  local orgMasterAccountID
+  orgMasterAccountID=$(getAccountId "$cliProfileString")
 
-  for account in $(echo $accounts | jq -r '.Id')
-  do
-      if [[ $orgMasterAccountID == $account ]]
-      then
-        echo "$0 $profile  $regionString --output csvnoheader"  >> $GENERATE_SCRIPT
-      else
-        echo "$0 $profile -o $ORG_ACCESS_ROLE -a $account $regionString --output csvnoheader"  >> $GENERATE_SCRIPT
-      fi
+  spinner_start "Fetching organization accounts for script generation…"
+  local accounts
+  accounts=$(aws $cliProfileString organizations list-accounts 2>/dev/null \
+    | jq -c '.Accounts[] | {Id, Name}')
+  spinner_stop
+
+  for account in $(echo "$accounts" | jq -r '.Id'); do
+    if [[ "$orgMasterAccountID" == "$account" ]]; then
+      echo "$0 ${profile} ${regionString} --output csvnoheader" >> "$GENERATE_SCRIPT"
+    else
+      echo "$0 ${profile} -o $ORG_ACCESS_ROLE -a $account ${regionString} --output csvnoheader" >> "$GENERATE_SCRIPT"
+    fi
   done
 }
 
 function generateScript {
-  echo Generating script $GENERATE_SCRIPT
+  if [[ -f "$GENERATE_SCRIPT" ]]; then
+    warn "Output script '${GENERATE_SCRIPT}' already exists and will be overwritten."
+  fi
+  info "Generating script: ${GENERATE_SCRIPT}"
 
-  echo "#!/bin/bash" > $GENERATE_SCRIPT
-  echo "echo $CSV_HEADER" >> $GENERATE_SCRIPT
-  chmod +x $GENERATE_SCRIPT
+  echo "#!/bin/bash" > "$GENERATE_SCRIPT"
+  echo "echo ${CSV_HEADER}" >> "$GENERATE_SCRIPT"
+  chmod +x "$GENERATE_SCRIPT"
 
   local scriptRegions=""
-  if [ -n "$REGIONS" ]
-  then
+  if [[ -n "$REGIONS" ]]; then
     scriptRegions="-r $REGIONS"
   fi
-  if [ -n "$ORG_ACCESS_ROLE" ]
-  then
-      for PROFILE in $(echo $AWS_PROFILE | sed "s/,/ /g")
-      do
+
+  local HAS_PROFILE=false
+  if [[ -n "$ORG_ACCESS_ROLE" ]]; then
+    if [[ -n "$AWS_PROFILE" ]]; then
+      HAS_PROFILE=true
+      for PROFILE in $(echo "$AWS_PROFILE" | sed "s/,/ /g"); do
         generateOrganizationScript "-p $PROFILE" "--profile $PROFILE" "$scriptRegions"
       done
-
-      if [ -z "$PROFILE" ]
-      then
-        generateOrganizationScript "" "" "$scriptRegions"
-      fi
+    fi
+    if [[ "$HAS_PROFILE" == "false" ]]; then
+      generateOrganizationScript "" "" "$scriptRegions"
+    fi
   else
-      for PROFILE in $(echo $AWS_PROFILE | sed "s/,/ /g")
-      do
-        echo "$0 $regionString -p $PROFILE $scriptRegions --output csvnoheader" >> $GENERATE_SCRIPT
+    if [[ -n "$AWS_PROFILE" ]]; then
+      HAS_PROFILE=true
+      for PROFILE in $(echo "$AWS_PROFILE" | sed "s/,/ /g"); do
+        echo "$0 -p $PROFILE $scriptRegions --output csvnoheader" >> "$GENERATE_SCRIPT"
       done
-
-      if [ -z "$PROFILE" ]
-      then
-        echo "$0 $regionString $scriptRegions --output csvnoheader"  >> $GENERATE_SCRIPT
-      fi
+    fi
+    if [[ "$HAS_PROFILE" == "false" ]]; then
+      echo "$0 $scriptRegions --output csvnoheader" >> "$GENERATE_SCRIPT"
+    fi
   fi
+
+  ok "Script generated: ${GENERATE_SCRIPT}  ($(wc -l < "$GENERATE_SCRIPT") lines)"
 }
 
-if [[ -n $GENERATE_SCRIPT ]]
-then
+# ─────────────────────────────────────────────────────────────────────────────
+# Entry point
+# ─────────────────────────────────────────────────────────────────────────────
+if [[ -n "$GENERATE_SCRIPT" ]]; then
   generateScript
 else
   runAnalysis
