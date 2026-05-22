@@ -1,0 +1,64 @@
+# FortiCNAPP AWS Inventory API — Kubernetes Deployment
+#
+# IRSA (IAM Roles for Service Accounts) is the recommended approach on EKS.
+# To use IRSA instead of the aws-credentials Secret:
+#   1. Create an IAM role with the required permissions and an OIDC trust policy.
+#   2. Create a Kubernetes ServiceAccount annotated with the IAM role ARN:
+#        kubectl create serviceaccount forticnapp-inventory
+#        kubectl annotate serviceaccount forticnapp-inventory \
+#          eks.amazonaws.com/role-arn=arn:aws:iam::ACCOUNT_ID:role/forticnapp-inventory-task-role
+#   3. Set spec.serviceAccountName: forticnapp-inventory below.
+#   4. Remove the envFrom block referencing aws-credentials.
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: forticnapp-aws-inventory
+  namespace: default
+  labels:
+    app: forticnapp-aws-inventory
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: forticnapp-aws-inventory
+  template:
+    metadata:
+      labels:
+        app: forticnapp-aws-inventory
+    spec:
+      # Uncomment and set when using IRSA:
+      # serviceAccountName: forticnapp-inventory
+      containers:
+        - name: forticnapp-aws-inventory
+          image: ACCOUNT_ID.dkr.ecr.REGION.amazonaws.com/forticnapp-aws-inventory:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8080
+              protocol: TCP
+          envFrom:
+            - secretRef:
+                name: aws-credentials
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+            limits:
+              cpu: "500m"
+              memory: "1Gi"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3

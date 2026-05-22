@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: forticnapp-aws-inventory
+  namespace: default
+  labels:
+    app: forticnapp-aws-inventory
+spec:
+  type: LoadBalancer
+  selector:
+    app: forticnapp-aws-inventory
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+      protocol: TCP
