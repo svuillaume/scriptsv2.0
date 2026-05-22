@@ -560,7 +560,9 @@ function analyzeOrganization {
 
   spinner_start "Fetching organization account list…"
   local accounts
-  accounts=$(aws $org_profile_string organizations list-accounts 2>&1 \
+  # --no-paginate ensures all accounts are returned in one response for large orgs (200+ accounts)
+  accounts=$(aws $org_profile_string organizations list-accounts \
+    --no-paginate --no-cli-pager 2>&1 \
     | jq -c '.Accounts[] | {Id, Name}')
   spinner_stop
 
@@ -690,7 +692,8 @@ function generateOrganizationScript {
 
   spinner_start "Fetching organization accounts for script generation…"
   local accounts
-  accounts=$(aws $cliProfileString organizations list-accounts 2>/dev/null \
+  accounts=$(aws $cliProfileString organizations list-accounts \
+    --no-paginate --no-cli-pager 2>/dev/null \
     | jq -c '.Accounts[] | {Id, Name}')
   spinner_stop
 
